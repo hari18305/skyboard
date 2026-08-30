@@ -7,8 +7,11 @@
   column remapping.
 - "Founder-level query" means natural business language ("how's pipeline for
   energy sector this quarter?"), not a structured query language — so the
-  agent needs to map loose language onto exact column names/filters itself,
-  which is why `get_board_schema` exists as a discovery step before querying.
+  agent needs to map loose language onto exact column names/filters itself.
+  Column discovery is done once per session in app code (not a model-callable
+  tool) and baked into the system prompt, both to save a tool round-trip and
+  because the small model we ended up on (see below) has a tight token budget
+  to spend carefully.
 - Given the 6-hour/2-hour time budget, correctness of computed numbers
   (deterministic aggregation) mattered more than conversational polish or
   breadth of supported query types.
@@ -29,10 +32,28 @@
   resilient to whatever the actual CSV schema turned out to be, and directly
   serves the "do not hardcode CSV data" requirement — the cleaning logic
   adapts to the live board schema rather than assuming fixed columns.
-- **Near-duplicate category merging via string-similarity (`difflib`)
-  rather than an LLM call per value.** Cheap and fast, good enough for
-  small-cardinality fields like sector/status; would not scale to
-  high-cardinality free text.
+- **Category normalization is exact-match-after-trim/case only, not fuzzy
+  string similarity.** Fuzzy matching (`difflib`) was tried first and
+  rejected: this data has many structured ID-like codes (`OWNER_001` vs
+  `OWNER_002`, `SDPLDEAL-075` vs `SDPLDEAL-101`) that are textually similar
+  but semantically distinct, and fuzzy matching was silently merging them —
+  a real correctness bug caught during live testing against the actual
+  boards, not a hypothetical. Exact-match-after-normalization is safer even
+  though it won't catch genuine free-text typos.
+- **Switched LLM provider mid-build: Gemini → Groq.** Built the first working
+  version on Gemini (`google-genai`, automatic function calling — the
+  cleanest API for this if it works). Live-tested it successfully against
+  the real boards, but its free tier's 5 requests/minute cap made even a
+  single question unreliable once tool-calling was involved (a multi-step
+  BI question can need several tool round-trips). Rather than ask for a
+  billed key or silently ship something flaky, switched to Groq, whose free
+  tier has far more headroom. Cost: Groq's SDK doesn't support automatic
+  function calling from Python objects, so the tool loop had to be
+  hand-written; also had to re-tune for Groq's own constraint (an 8K
+  tokens/minute cap per model) by trimming conversation history sent per
+  request and keeping tool-result payloads small. This is the single
+  biggest "designed around a real constraint under time pressure" decision
+  in this project.
 
 ## How "leadership updates" was interpreted
 Interpreted as: a founder wants a short, structured, executive-ready digest
@@ -60,3 +81,10 @@ this shouldn't consume core-feature time.
 - Add a proper cross-board join tool (e.g. matching deals to work orders by
   client/project name) rather than relying on the model to reason across two
   separately-fetched tables.
+- Tighten the system prompt to discourage the model from making more
+  `compute_aggregate` calls than a question needs — observed it probing
+  count/sum/avg/breakdown somewhat exhaustively for open-ended questions
+  ("how's pipeline for X"), which produces a genuinely good, insightful
+  answer but costs more tool round-trips (and token budget) than strictly
+  necessary. A few-shot example or a stricter "plan your queries before
+  calling tools" instruction would likely cut this down.

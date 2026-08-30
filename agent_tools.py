@@ -1,12 +1,17 @@
 """
-The tool surface the Gemini agent is given. Kept deliberately small (3 tools)
-and generic so the model can answer arbitrary founder-level questions without
-us hardcoding query logic per question type.
+The tool surface the agent is given. Kept deliberately small and generic so
+the model can answer arbitrary founder-level questions without us
+hardcoding query logic per question type.
 
 Design choice: numeric aggregation is computed here in pandas, NOT left to
 the LLM to eyeball from a data dump. For a BI agent, "the pipeline total is
 $X" has to be exactly right — so the model's job is choosing *which*
 aggregate to run and narrating the result, not doing the arithmetic itself.
+
+This module also exports OpenAI-style JSON tool schemas (TOOL_SCHEMAS) and a
+name->function dispatch table (TOOL_FUNCS), used by app.py to drive Groq's
+manual tool-calling loop (Groq's SDK, unlike google-genai, does not do
+automatic function calling from plain Python callables).
 """
 import json
 
@@ -44,18 +49,24 @@ def get_board_schema(board: str) -> str:
     return json.dumps({"board_name": clean["board_name"], "columns": clean["schema"]})
 
 
-def get_board_data(board: str, max_rows: int = 200) -> str:
+def get_board_data(board: str, max_rows: int = 15) -> str:
     """Fetch cleaned, normalized records from a monday.com board ('work_orders' or
     'deals'). Missing values have been left as null (not dropped), inconsistent
     date formats parsed to ISO dates, and near-duplicate category labels (e.g.
     'Energy' vs 'energy ') merged. Use this to inspect actual rows, e.g. to
     answer questions that need row-level detail rather than a single number.
 
+    IMPORTANT: max_rows defaults to a small number on purpose — this agent
+    runs on a token-budget-constrained model. Never raise max_rows past ~30
+    unless the user explicitly needs many individual rows listed out. For
+    any total, count, sum, average, or breakdown-by-category, always use
+    compute_aggregate instead — it operates on the full board without
+    consuming your context budget.
+
     Returns a JSON string: {"board_name", "row_count", "data_quality_notes",
     "records": [ {column: value, ...}, ... ]}. If row_count exceeds max_rows,
     only the first max_rows records are returned (row_count still reflects the
-    true total) — prefer compute_aggregate for questions about totals/counts
-    over the full board.
+    true total).
     """
     if board not in VALID_BOARDS:
         return _error(f"Unknown board '{board}'. Must be one of {VALID_BOARDS}.")
@@ -178,4 +189,67 @@ def compute_aggregate(
     )
 
 
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_board_data",
+            "description": (
+                "Fetch cleaned, normalized row-level records from a monday.com board. "
+                "Only use for row-level detail (e.g. 'list a few examples'); NEVER for "
+                "totals/counts/sums/averages — use compute_aggregate for those instead, "
+                "since it doesn't consume your limited context budget."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string", "enum": list(VALID_BOARDS)},
+                    "max_rows": {
+                        "type": "integer",
+                        "description": "Max rows to return. Keep small (default 15, rarely go above 30).",
+                    },
+                },
+                "required": ["board"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compute_aggregate",
+            "description": (
+                "Compute an exact, deterministic aggregate (sum/count/avg/min/max/median) "
+                "over a full monday.com board, with optional group_by and filters. Always "
+                "prefer this over get_board_data for any total, count, sum, average, or "
+                "breakdown-by-category question — the number is computed in pandas, not "
+                "estimated by you."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board": {"type": "string", "enum": list(VALID_BOARDS)},
+                    "metric": {
+                        "type": "string",
+                        "description": "Numeric column to aggregate, e.g. 'Masked Deal value'. Omit/empty when agg='count'.",
+                    },
+                    "agg": {"type": "string", "enum": list(VALID_AGGS)},
+                    "group_by": {
+                        "type": "string",
+                        "description": "Optional column to break the result down by, e.g. 'Sector/service'.",
+                    },
+                    "filters_json": {
+                        "type": "string",
+                        "description": 'Optional JSON object string of {"column_name": "value"} substring filters, e.g. \'{"Sector/service": "Energy"}\'.',
+                    },
+                },
+                "required": ["board", "agg"],
+            },
+        },
+    },
+]
+
+TOOL_FUNCS = {"get_board_data": get_board_data, "compute_aggregate": compute_aggregate}
+
+# Kept for local/debugging use (e.g. app.py's schema-baking at session start).
+# Not registered as a callable tool for the LLM — see TOOL_SCHEMAS above.
 TOOLS = [get_board_schema, get_board_data, compute_aggregate]

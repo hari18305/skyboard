@@ -3,8 +3,14 @@ Streamlit chat front-end for the monday.com Business Intelligence agent.
 
 Run locally:   streamlit run app.py
 Deploy:        push to GitHub, deploy on https://share.streamlit.io
-               (set GEMINI_API_KEY / MONDAY_API_TOKEN / MONDAY_WORK_ORDERS_BOARD_ID
+               (set GROQ_API_KEY / MONDAY_API_TOKEN / MONDAY_WORK_ORDERS_BOARD_ID
                / MONDAY_DEALS_BOARD_ID in the app's Secrets)
+
+LLM: Groq (openai/gpt-oss-120b by default). Groq's Python SDK mirrors the
+OpenAI SDK and does NOT do automatic function calling from plain Python
+objects the way google-genai does — so this file drives a manual tool-call
+loop: ask the model, check for tool_calls, execute them locally, feed the
+results back, repeat until the model returns a plain text answer.
 """
 import json
 import re
@@ -12,31 +18,25 @@ import time
 from datetime import date
 
 import streamlit as st
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
+from groq import Groq, APIStatusError
 
-from agent_tools import get_board_data, compute_aggregate, get_board_schema
-
-# get_board_schema is deliberately NOT offered to Gemini as a callable tool —
-# its output is baked into the system prompt below (fetched fresh each
-# session via a plain Python call) so the model never needs to spend a
-# rate-limited API round-trip discovering column names it already has.
-AGENT_TOOLS = [get_board_data, compute_aggregate]
-from config import GEMINI_API_KEY, GEMINI_MODEL, MONDAY_API_TOKEN, BOARD_IDS
+from agent_tools import TOOL_SCHEMAS, TOOL_FUNCS, get_board_schema
+from config import GROQ_API_KEY, GROQ_MODEL, MONDAY_API_TOKEN, BOARD_IDS
 
 st.set_page_config(page_title="Skylark BI Agent", page_icon="📊", layout="centered")
+
+MAX_TOOL_ITERS = 10
 
 
 def _describe_schema() -> str:
     """
-    Fetches both boards' live column schema via a plain Python call (no
-    Gemini request involved, so it costs nothing against the API rate
-    limit) and formats it for the system prompt. This lets the model skip
-    a get_board_schema tool round-trip on every question — cutting typical
-    Gemini calls per question roughly in half — while staying honest to
-    "query monday.com dynamically": the schema is fetched fresh from the
-    live board each session, never hardcoded.
+    Fetches both boards' live column schema via a plain Python call (costs
+    nothing against the LLM's rate/token limits) and formats it for the
+    system prompt, so the model doesn't spend a tool round-trip (and
+    precious tokens, on a model with only an 8K-token/minute budget)
+    discovering column names it can just be told upfront. Still honest to
+    "query monday.com dynamically" — this is fetched fresh each session,
+    never hardcoded.
     """
     lines = []
     for board in ("work_orders", "deals"):
@@ -66,22 +66,25 @@ Rules you must follow:
    depends on the boards.
 2. For any total, count, sum, average, or breakdown-by-category, use
    compute_aggregate rather than eyeballing raw rows — its numbers are exact,
-   yours from memory are not.
-3. The underlying data is real-world and messy: missing values, inconsistent
+   yours from memory are not, and it's far cheaper on your limited token
+   budget than dumping rows via get_board_data.
+3. Keep get_board_data calls small (max_rows around 15, rarely above 30) —
+   you are running on a model with a tight per-minute token budget.
+4. The underlying data is real-world and messy: missing values, inconsistent
    date formats, and near-duplicate category labels have already been
    partially cleaned for you, but gaps remain. When a tool result includes
    data_quality_notes relevant to your answer, briefly surface the caveat to
    the user (e.g. "note: 4 of 52 deals had no close date and were excluded").
    Don't hide data quality problems, but don't dump every note either — only
    the ones relevant to the numbers you're citing.
-4. If a question is ambiguous (unclear time period, unclear which board,
+5. If a question is ambiguous (unclear time period, unclear which board,
    unclear metric, a sector/category name that doesn't clearly match what's
    in the data), ask a short clarifying question instead of guessing.
-5. When you have both a number and business context, don't just state the
+6. When you have both a number and business context, don't just state the
    number — add one or two sentences of insight (e.g. what's driving it,
    what's notable, what's missing), since the user is a founder/executive
    who wants insight, not a raw query result.
-6. Be concise. This is a chat, not a report — unless the user explicitly asks
+7. Be concise. This is a chat, not a report — unless the user explicitly asks
    for a leadership-update-style summary, in which case use clear headers
    and short bullets.
 """
@@ -99,74 +102,96 @@ def boards_configured() -> bool:
     return bool(MONDAY_API_TOKEN and BOARD_IDS.get("work_orders") and BOARD_IDS.get("deals"))
 
 
-def send(text: str):
-    """
-    Sends one message and gets a reply.
+def _extract_retry_delay(exc: Exception) -> float:
+    """Best-effort parse of a suggested retry delay out of a Groq 429 error."""
+    match = re.search(r"try again in ([\d.]+)s", str(exc), re.IGNORECASE)
+    if match:
+        return min(float(match.group(1)), 30) + 0.5
+    return 5.0
 
-    Note: we deliberately create a brand-new genai.Client + chat on every
-    call rather than caching one long-lived chat object across Streamlit
-    reruns — the SDK's underlying transport was observed to close itself
-    after a single request in that usage pattern ("client has been closed"
-    on the second message). Conversation continuity is preserved instead by
-    replaying prior turns as `history` into the fresh chat.
+
+def run_agent(client: Groq, messages: list) -> str:
     """
+    Drives the manual tool-calling loop against Groq. `messages` is mutated
+    in place (assistant/tool turns appended) so the caller's history stays
+    in sync; returns the final assistant text.
+    """
+    for _ in range(MAX_TOOL_ITERS):
+        answer = None
+        for attempt in range(1, 4):
+            try:
+                resp = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=messages,
+                    tools=TOOL_SCHEMAS,
+                    tool_choice="auto",
+                    temperature=0.2,
+                )
+                break
+            except APIStatusError as e:
+                if e.status_code == 429 and attempt < 3:
+                    delay = _extract_retry_delay(e)
+                    with st.spinner(f"Rate-limited, retrying in {delay:.0f}s..."):
+                        time.sleep(delay)
+                    continue
+                return f"⚠️ The agent hit a Groq API error: {e}"
+        else:
+            return "⚠️ Still rate-limited after retries — please wait a few seconds and try again."
+
+        msg = resp.choices[0].message
+
+        if not msg.tool_calls:
+            return msg.content or "(no response)"
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+        )
+
+        for tc in msg.tool_calls:
+            func = TOOL_FUNCS.get(tc.function.name)
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            if func is None:
+                result = json.dumps({"error": f"Unknown tool '{tc.function.name}'"})
+            else:
+                try:
+                    result = func(**args)
+                except Exception as e:
+                    result = json.dumps({"error": f"Tool '{tc.function.name}' raised: {e}"})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    return "⚠️ Reached the tool-call step limit without a final answer — try rephrasing your question."
+
+
+def send(text: str):
     st.session_state.messages.append({"role": "user", "content": text})
 
-    # attempts=1 disables the SDK's own internal retry-with-backoff on
-    # transient errors (observed to silently retry for minutes on 429s
-    # before ever raising) — our retry loop below handles that instead,
-    # with a visible spinner and a bounded wait.
-    client = genai.Client(
-        api_key=GEMINI_API_KEY,
-        http_options=types.HttpOptions(
-            timeout=30_000,
-            retry_options=types.HttpRetryOptions(attempts=1),
-        ),
-    )
-    history = [
-        types.Content(
-            role=("model" if m["role"] == "assistant" else "user"),
-            parts=[types.Part(text=m["content"])],
-        )
-        for m in st.session_state.messages[:-1]  # everything before this new user turn
+    # Trim to the last few conversational turns before sending — full
+    # history (including old tool-call/tool-result messages) would burn
+    # through the 8K-token/minute budget fast on a multi-turn chat.
+    RECENT_TURNS = 6
+    recent = [m for m in st.session_state.messages if m["role"] in ("user", "assistant")][-RECENT_TURNS:]
+
+    client = Groq(api_key=GROQ_API_KEY)
+    conversation = [{"role": "system", "content": SYSTEM_PROMPT}] + [
+        {"role": m["role"], "content": m["content"]} for m in recent
     ]
 
-    answer = None
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        try:
-            with st.spinner("Thinking..." if attempt == 1 else f"Rate-limited, retrying (attempt {attempt}/{max_attempts})..."):
-                chat = client.chats.create(
-                    model=GEMINI_MODEL,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        tools=AGENT_TOOLS,
-                    ),
-                    history=history,
-                )
-                response = chat.send_message(text)
-                answer = response.text
-            break
-        except genai_errors.ClientError as e:
-            is_rate_limit = getattr(e, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e)
-            if is_rate_limit and attempt < max_attempts:
-                match = re.search(r"retry in ([\d.]+)s", str(e))
-                delay = min(float(match.group(1)), 60) + 1 if match else 15
-                with st.spinner(f"Gemini free-tier rate limit hit — waiting {int(delay)}s before retrying..."):
-                    time.sleep(delay)
-                continue
-            if is_rate_limit:
-                answer = (
-                    "⚠️ Hit the Gemini free-tier rate limit (5 requests/min) and retries were "
-                    "exhausted. Please wait ~30-60s and ask again — or use an API key with billing "
-                    "enabled for higher limits."
-                )
-            else:
-                answer = f"⚠️ The agent hit an error talking to Gemini: {e}"
-            break
-        except Exception as e:
-            answer = f"⚠️ The agent hit an unexpected error: {e}"
-            break
+    with st.spinner("Thinking..."):
+        answer = run_agent(client, conversation)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
@@ -174,8 +199,8 @@ def send(text: str):
 st.title("📊 Skylark BI Agent")
 st.caption("Conversational business intelligence over your monday.com Work Orders and Deals boards.")
 
-if not GEMINI_API_KEY:
-    st.error("GEMINI_API_KEY is not configured. Set it in your .env (local) or Secrets (Streamlit Cloud).")
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY is not configured. Set it in your .env (local) or Secrets (Streamlit Cloud).")
     st.stop()
 
 if not boards_configured():
@@ -190,14 +215,13 @@ if "messages" not in st.session_state:
 
 with st.sidebar:
     st.subheader("Status")
-    st.write("✅ Gemini configured" if GEMINI_API_KEY else "❌ Gemini not configured")
+    st.write("✅ Groq configured" if GROQ_API_KEY else "❌ Groq not configured")
     st.write("✅ monday.com configured" if boards_configured() else "❌ monday.com not configured")
     st.divider()
     if st.button("📋 Generate leadership update"):
         send(LEADERSHIP_UPDATE_PROMPT)
     if st.button("🔄 Reset conversation"):
         st.session_state.messages = []
-        st.session_state.pop("chat", None)
         st.rerun()
 
 for msg in st.session_state.messages:

@@ -32,10 +32,11 @@ agent_tools.py        — tools exposed to the LLM:
         ▼
 app.py (Streamlit)    — chat UI. Fetches both boards' schema live via a plain
                          Python call and bakes it into the system prompt, so
-                         Gemini never spends an API round-trip discovering
-                         column names. Gemini (google-genai) then drives the
-                         remaining tool-calling loop: it decides which tool(s)
-                         to call, we execute them, it synthesizes the answer.
+                         the model never spends an API round-trip discovering
+                         column names. Groq (`openai/gpt-oss-120b`) then
+                         drives a manual tool-calling loop: ask the model,
+                         execute any tool_calls it returns, feed results
+                         back, repeat until it returns a plain-text answer.
                          Retries with backoff on rate-limit (429) errors.
 ```
 
@@ -50,7 +51,7 @@ rather than quietly dropping rows.
 
 | Layer | Choice | Why |
 |---|---|---|
-| LLM / agent loop | Gemini (`google-genai`, automatic function calling) | Available API key; native tool-use means no hand-rolled function-call parser |
+| LLM / agent loop | Groq (`openai/gpt-oss-120b`), manual tool-calling loop | Started on Gemini, but its free tier's 5 requests/minute cap made even a single multi-tool-call question unreliable (see below); Groq's free tier (1000 req + a per-minute token budget per model) is far more workable, at the cost of writing the tool-call loop by hand since Groq's SDK doesn't do automatic function calling from Python objects the way `google-genai` does |
 | monday.com integration | Direct GraphQL v2 API (`requests`) | Full control, no extra infra, satisfies "MCP or API — your choice" |
 | Data cleaning | `pandas` | Fast, expressive normalization/aggregation |
 | UI | Streamlit `st.chat_message` | Fastest path to a real conversational UI + free public hosting |
@@ -61,7 +62,7 @@ rather than quietly dropping rows.
 1. **monday.com**: import the two CSVs as separate boards (Work Orders, Deals),
    note each board's ID from its URL, and generate a personal API token
    (Avatar → Administration → API).
-2. Copy `.env.example` to `.env` and fill in `GEMINI_API_KEY`,
+2. Copy `.env.example` to `.env` and fill in `GROQ_API_KEY`,
    `MONDAY_API_TOKEN`, `MONDAY_WORK_ORDERS_BOARD_ID`, `MONDAY_DEALS_BOARD_ID`.
 3. `pip install -r requirements.txt`
 4. `streamlit run app.py`
@@ -91,20 +92,29 @@ Deploy.
   a dedicated small classification pass would be more robust for messier text.
 - No pagination past 500 items per board.
 - No caching layer, so latency scales with monday.com API round-trips.
-- Observed the Gemini free tier's rate limits during live testing — both a
-  250k input-token/minute cap and, more restrictively, only **5 requests/
-  minute** on `gemini-3.6-flash`. Since automatic function calling spends one
-  Gemini call per tool round-trip, a single question can use 2-3 of those 5.
-  Mitigated two ways: (1) baked the board schema into the system prompt so
-  the model no longer spends a call discovering columns, cutting typical
-  calls-per-question roughly in half; (2) added retry-with-backoff (reading
-  the API's own suggested retry delay) so a 429 degrades into "please wait
-  ~Ns" instead of a crash. Also had to disable the SDK's own internal retry
-  (`HttpRetryOptions(attempts=1)`) — it was silently retrying 429s for
-  minutes before ever surfacing the error, which made failures invisible
-  instead of just slow. On a billed API key this constraint disappears
-  entirely; documented here because it's a real constraint we hit and
-  designed around, not a hypothetical.
+- **Switched LLM provider mid-build (Gemini → Groq)**, and it's worth being
+  honest about why: `gemini-3.6-flash`'s free tier caps out at 5
+  requests/minute, and since automatic function calling spends one Gemini
+  call per tool round-trip, a single multi-step question could burn the
+  entire budget by itself — even after optimizations (baking the schema into
+  the system prompt to cut calls-per-question roughly in half) it was still
+  not reliable enough to demo. Groq's free tier (1000 requests + a per-minute
+  *token* budget per model) has much more headroom. The trade-off: Groq's
+  SDK doesn't do automatic function calling from Python objects, so the
+  tool-calling loop in `app.py::run_agent` is hand-written (call model →
+  check `tool_calls` → execute → feed results back → repeat).
+- Groq's free tier still caps `openai/gpt-oss-120b` at **8,000 tokens/minute**
+  — tight, since a thorough BI answer (e.g. "how's pipeline for sector X"
+  ended up making 5-6 tool calls to check count, value, average, and stage
+  breakdown) resends the growing conversation each round-trip and can approach
+  that ceiling within a single question. Mitigated by: keeping `get_board_data`
+  row limits small (default 15) so row dumps don't dominate the budget, always
+  preferring `compute_aggregate` (small JSON responses) over raw rows, trimming
+  chat history to the last few turns before each request, and retry-with-backoff
+  on 429s (parses the API's suggested wait and retries up to 3 times) so a
+  rate limit degrades into a visible "retrying in Ns" instead of a crash. On a
+  paid Groq tier this ceiling is far higher; documented here because it's a
+  real constraint hit and designed around, not a hypothetical.
 - Clarifying-question behavior depends on the model choosing to ask rather
   than guess — good system-prompt discipline helps but isn't a hard guarantee.
 

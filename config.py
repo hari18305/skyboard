@@ -18,8 +18,8 @@ def get_secret(key: str, default=None):
     return os.environ.get(key, default)
 
 
-GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
-GEMINI_MODEL = get_secret("GEMINI_MODEL", "gemini-3.6-flash")
+GROQ_API_KEY = get_secret("GROQ_API_KEY")
+GROQ_MODEL = get_secret("GROQ_MODEL", "openai/gpt-oss-120b")
 
 MONDAY_API_TOKEN = get_secret("MONDAY_API_TOKEN")
 MONDAY_WORK_ORDERS_BOARD_ID = get_secret("MONDAY_WORK_ORDERS_BOARD_ID")
