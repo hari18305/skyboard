@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.venv/
+venv/
+
+# Raw/derived assignment data — lives in monday.com, not in the public repo.
+*.xlsx
+*.csv
