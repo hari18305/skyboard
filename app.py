@@ -68,7 +68,7 @@ Rules you must follow:
    compute_aggregate rather than eyeballing raw rows — its numbers are exact,
    yours from memory are not, and it's far cheaper on your limited token
    budget than dumping rows via get_board_data.
-3. Keep get_board_data calls small (max_rows around 15, rarely above 30) —
+3. Keep get_board_data calls small (max_rows around 10, hard-capped at 20) —
    you are running on a model with a tight per-minute token budget.
 4. The underlying data is real-world and messy: missing values, inconsistent
    date formats, and near-duplicate category labels have already been
@@ -110,6 +110,23 @@ def _extract_retry_delay(exc: Exception) -> float:
     return 5.0
 
 
+def _shrink_largest_message(messages: list) -> bool:
+    """
+    Safety net for a 413 (request too large): tool-result payloads are
+    sized to stay well under budget on their own (see agent_tools.py), but
+    accumulated multi-turn history could still occasionally push a request
+    over the limit. Truncates the largest tool-result message in place.
+    Returns False if there's nothing left worth shrinking (caller should
+    give up rather than loop forever).
+    """
+    candidates = [i for i, m in enumerate(messages) if m.get("role") == "tool" and len(m.get("content", "")) > 500]
+    if not candidates:
+        return False
+    idx = max(candidates, key=lambda i: len(messages[i]["content"]))
+    messages[idx]["content"] = messages[idx]["content"][:500] + '..."[truncated — result was too large]"'
+    return True
+
+
 def run_agent(client: Groq, messages: list) -> str:
     """
     Drives the manual tool-calling loop against Groq. `messages` is mutated
@@ -133,6 +150,10 @@ def run_agent(client: Groq, messages: list) -> str:
                     delay = _extract_retry_delay(e)
                     with st.spinner(f"Rate-limited, retrying in {delay:.0f}s..."):
                         time.sleep(delay)
+                    continue
+                if e.status_code == 413 and attempt < 3 and _shrink_largest_message(messages):
+                    # Too-large errors aren't time-based — retry immediately
+                    # after shrinking, no point sleeping.
                     continue
                 return f"⚠️ The agent hit a Groq API error: {e}"
         else:

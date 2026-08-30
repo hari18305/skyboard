@@ -49,7 +49,10 @@ def get_board_schema(board: str) -> str:
     return json.dumps({"board_name": clean["board_name"], "columns": clean["schema"]})
 
 
-def get_board_data(board: str, max_rows: int = 15) -> str:
+MAX_TOOL_RESULT_CHARS = 3500  # ~875 tokens — keeps a single tool call from ever dominating an 8K TPM budget
+
+
+def get_board_data(board: str, max_rows: int = 10) -> str:
     """Fetch cleaned, normalized records from a monday.com board ('work_orders' or
     'deals'). Missing values have been left as null (not dropped), inconsistent
     date formats parsed to ISO dates, and near-duplicate category labels (e.g.
@@ -57,16 +60,22 @@ def get_board_data(board: str, max_rows: int = 15) -> str:
     answer questions that need row-level detail rather than a single number.
 
     IMPORTANT: max_rows defaults to a small number on purpose — this agent
-    runs on a token-budget-constrained model. Never raise max_rows past ~30
+    runs on a token-budget-constrained model. Never raise max_rows past ~20
     unless the user explicitly needs many individual rows listed out. For
     any total, count, sum, average, or breakdown-by-category, always use
     compute_aggregate instead — it operates on the full board without
-    consuming your context budget.
+    consuming your context budget. Note: work_orders has 38 columns — a
+    handful of rows from it can already be a large payload, so prefer small
+    max_rows there especially.
 
     Returns a JSON string: {"board_name", "row_count", "data_quality_notes",
-    "records": [ {column: value, ...}, ... ]}. If row_count exceeds max_rows,
-    only the first max_rows records are returned (row_count still reflects the
-    true total).
+    "columns": [col1, col2, ...], "rows": [[v1, v2, ...], ...]} — a compact
+    table (column names given once, then plain value arrays) rather than
+    repeating full column names per row, since some boards here have very
+    long column names and 30+ columns. Match each row's values to `columns`
+    by position. Columns null across every returned row are omitted entirely
+    (noted separately) — they carry no information anyway. If still too
+    large, rows are trimmed further and a note says so.
     """
     if board not in VALID_BOARDS:
         return _error(f"Unknown board '{board}'. Must be one of {VALID_BOARDS}.")
@@ -75,17 +84,48 @@ def get_board_data(board: str, max_rows: int = 15) -> str:
     except MondayError as e:
         return _error(str(e))
 
+    max_rows = max(1, min(max_rows, 20))
     records = clean["records"][:max_rows]
-    return json.dumps(
-        {
-            "board_name": clean["board_name"],
-            "row_count": clean["row_count"],
-            "returned_rows": len(records),
-            "data_quality_notes": clean["data_quality_notes"],
-            "records": records,
-        },
-        default=str,
-    )
+
+    # Drop columns that are null across every returned row — they add tokens
+    # without adding information, and boards with 30+ columns are mostly
+    # sparse (e.g. work_orders columns like "Person"/"Status" are ~98% null).
+    columns = list(records[0].keys()) if records else []
+    dropped_cols = [k for k in columns if all(r.get(k) is None for r in records)] if records else []
+    columns = [c for c in columns if c not in dropped_cols]
+
+    def _build(recs):
+        notes = clean["data_quality_notes"][:3]  # full list can be 60+ entries on wide boards — just a taste here
+        if dropped_cols:
+            notes.append(f"{len(dropped_cols)} column(s) omitted below (null in every returned row)")
+        rows = [[r.get(c) for c in columns] for r in recs]
+        return json.dumps(
+            {
+                "board_name": clean["board_name"],
+                "row_count": clean["row_count"],
+                "returned_rows": len(recs),
+                "data_quality_notes": notes,
+                "columns": columns,
+                "rows": rows,
+            },
+            default=str,
+        )
+
+    result = _build(records)
+    # Backstop: if even after dropping empty columns the payload is still
+    # large (e.g. a wide board with few nulls), keep shrinking row count
+    # until it fits a safe size, rather than risk a 413 from the LLM API.
+    while len(result) > MAX_TOOL_RESULT_CHARS and len(records) > 1:
+        records = records[: max(1, len(records) // 2)]
+        result = _build(records)
+    # Still too large even at 1 row (a very wide board with long values) —
+    # drop columns one at a time (shortest-name-first kept, since verbose
+    # column names/values tend to be the least essential free-text fields)
+    # until it actually fits, keeping at least 3 columns no matter what.
+    while len(result) > MAX_TOOL_RESULT_CHARS and len(columns) > 3:
+        columns = sorted(columns, key=len)[:-1]
+        result = _build(records[:1] if records else [])
+    return result
 
 
 def compute_aggregate(
@@ -206,7 +246,7 @@ TOOL_SCHEMAS = [
                     "board": {"type": "string", "enum": list(VALID_BOARDS)},
                     "max_rows": {
                         "type": "integer",
-                        "description": "Max rows to return. Keep small (default 15, rarely go above 30).",
+                        "description": "Max rows to return. Keep small (default 10, hard-capped at 20).",
                     },
                 },
                 "required": ["board"],
