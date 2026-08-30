@@ -6,16 +6,48 @@ Deploy:        push to GitHub, deploy on https://share.streamlit.io
                (set GEMINI_API_KEY / MONDAY_API_TOKEN / MONDAY_WORK_ORDERS_BOARD_ID
                / MONDAY_DEALS_BOARD_ID in the app's Secrets)
 """
+import json
+import re
+import time
 from datetime import date
 
 import streamlit as st
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
-from agent_tools import TOOLS
+from agent_tools import get_board_data, compute_aggregate, get_board_schema
+
+# get_board_schema is deliberately NOT offered to Gemini as a callable tool —
+# its output is baked into the system prompt below (fetched fresh each
+# session via a plain Python call) so the model never needs to spend a
+# rate-limited API round-trip discovering column names it already has.
+AGENT_TOOLS = [get_board_data, compute_aggregate]
 from config import GEMINI_API_KEY, GEMINI_MODEL, MONDAY_API_TOKEN, BOARD_IDS
 
 st.set_page_config(page_title="Skylark BI Agent", page_icon="📊", layout="centered")
+
+
+def _describe_schema() -> str:
+    """
+    Fetches both boards' live column schema via a plain Python call (no
+    Gemini request involved, so it costs nothing against the API rate
+    limit) and formats it for the system prompt. This lets the model skip
+    a get_board_schema tool round-trip on every question — cutting typical
+    Gemini calls per question roughly in half — while staying honest to
+    "query monday.com dynamically": the schema is fetched fresh from the
+    live board each session, never hardcoded.
+    """
+    lines = []
+    for board in ("work_orders", "deals"):
+        try:
+            info = json.loads(get_board_schema(board))
+            cols = ", ".join(info.get("columns", {}).keys())
+            lines.append(f"- {board}: {cols}")
+        except Exception:
+            lines.append(f"- {board}: (schema unavailable — monday.com may not be configured yet)")
+    return "\n".join(lines)
+
 
 SYSTEM_PROMPT = f"""You are a business intelligence analyst agent for a company's
 leadership team. You answer questions by querying two live monday.com boards:
@@ -24,10 +56,14 @@ Today's date is {date.today().isoformat()} — resolve relative time references
 ("this quarter", "this month", "YTD") against it yourself; do not ask the user
 what today's date is.
 
+Known columns on each board (fetched live at session start — use these exact
+names in tool calls, no need to re-discover them):
+{_describe_schema()}
+
 Rules you must follow:
-1. Never invent or assume data. Always call a tool (get_board_schema,
-   get_board_data, or compute_aggregate) to get real values before answering
-   a question that depends on the boards.
+1. Never invent or assume data. Always call a tool (get_board_data or
+   compute_aggregate) to get real values before answering a question that
+   depends on the boards.
 2. For any total, count, sum, average, or breakdown-by-category, use
    compute_aggregate rather than eyeballing raw rows — its numbers are exact,
    yours from memory are not.
@@ -63,27 +99,75 @@ def boards_configured() -> bool:
     return bool(MONDAY_API_TOKEN and BOARD_IDS.get("work_orders") and BOARD_IDS.get("deals"))
 
 
-def get_chat():
-    if "chat" not in st.session_state:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        st.session_state.chat = client.chats.create(
-            model=GEMINI_MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                tools=TOOLS,
-            ),
-        )
-    return st.session_state.chat
-
-
 def send(text: str):
+    """
+    Sends one message and gets a reply.
+
+    Note: we deliberately create a brand-new genai.Client + chat on every
+    call rather than caching one long-lived chat object across Streamlit
+    reruns — the SDK's underlying transport was observed to close itself
+    after a single request in that usage pattern ("client has been closed"
+    on the second message). Conversation continuity is preserved instead by
+    replaying prior turns as `history` into the fresh chat.
+    """
     st.session_state.messages.append({"role": "user", "content": text})
-    with st.spinner("Thinking..."):
+
+    # attempts=1 disables the SDK's own internal retry-with-backoff on
+    # transient errors (observed to silently retry for minutes on 429s
+    # before ever raising) — our retry loop below handles that instead,
+    # with a visible spinner and a bounded wait.
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            timeout=30_000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+    history = [
+        types.Content(
+            role=("model" if m["role"] == "assistant" else "user"),
+            parts=[types.Part(text=m["content"])],
+        )
+        for m in st.session_state.messages[:-1]  # everything before this new user turn
+    ]
+
+    answer = None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         try:
-            response = get_chat().send_message(text)
-            answer = response.text
+            with st.spinner("Thinking..." if attempt == 1 else f"Rate-limited, retrying (attempt {attempt}/{max_attempts})..."):
+                chat = client.chats.create(
+                    model=GEMINI_MODEL,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        tools=AGENT_TOOLS,
+                    ),
+                    history=history,
+                )
+                response = chat.send_message(text)
+                answer = response.text
+            break
+        except genai_errors.ClientError as e:
+            is_rate_limit = getattr(e, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e)
+            if is_rate_limit and attempt < max_attempts:
+                match = re.search(r"retry in ([\d.]+)s", str(e))
+                delay = min(float(match.group(1)), 60) + 1 if match else 15
+                with st.spinner(f"Gemini free-tier rate limit hit — waiting {int(delay)}s before retrying..."):
+                    time.sleep(delay)
+                continue
+            if is_rate_limit:
+                answer = (
+                    "⚠️ Hit the Gemini free-tier rate limit (5 requests/min) and retries were "
+                    "exhausted. Please wait ~30-60s and ask again — or use an API key with billing "
+                    "enabled for higher limits."
+                )
+            else:
+                answer = f"⚠️ The agent hit an error talking to Gemini: {e}"
+            break
         except Exception as e:
-            answer = f"⚠️ The agent hit an error talking to Gemini or monday.com: {e}"
+            answer = f"⚠️ The agent hit an unexpected error: {e}"
+            break
+
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
 

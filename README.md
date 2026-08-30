@@ -21,16 +21,22 @@ data_utils.py        — cleaning layer, generic over monday.com column types:
                          • every gap recorded as a human-readable
                            data_quality_note instead of silently vanishing
         ▼
-agent_tools.py        — 3 tools exposed to the LLM:
-                         • get_board_schema   – discover columns before querying
+agent_tools.py        — tools exposed to the LLM:
                          • get_board_data     – inspect cleaned row-level data
                          • compute_aggregate  – exact sum/count/avg/min/max/median,
                                                  optional group_by + filters,
                                                  computed in pandas (not by the LLM)
+                         (get_board_schema also lives here, but is called
+                         directly by app.py at session start, not by the LLM —
+                         see below)
         ▼
-app.py (Streamlit)    — chat UI. Gemini (google-genai) drives the tool-calling
-                         loop automatically: the model decides which tool(s)
+app.py (Streamlit)    — chat UI. Fetches both boards' schema live via a plain
+                         Python call and bakes it into the system prompt, so
+                         Gemini never spends an API round-trip discovering
+                         column names. Gemini (google-genai) then drives the
+                         remaining tool-calling loop: it decides which tool(s)
                          to call, we execute them, it synthesizes the answer.
+                         Retries with backoff on rate-limit (429) errors.
 ```
 
 **Why this shape:** the assignment's own framing ("business data is messy",
@@ -85,10 +91,20 @@ Deploy.
   a dedicated small classification pass would be more robust for messier text.
 - No pagination past 500 items per board.
 - No caching layer, so latency scales with monday.com API round-trips.
-- Observed the Gemini free-tier per-minute token quota (250k) during live
-  testing — rapid successive queries can hit a 429. The app catches this and
-  shows a friendly error instead of crashing, but a production version would
-  need retry/backoff or a paid tier.
+- Observed the Gemini free tier's rate limits during live testing — both a
+  250k input-token/minute cap and, more restrictively, only **5 requests/
+  minute** on `gemini-3.6-flash`. Since automatic function calling spends one
+  Gemini call per tool round-trip, a single question can use 2-3 of those 5.
+  Mitigated two ways: (1) baked the board schema into the system prompt so
+  the model no longer spends a call discovering columns, cutting typical
+  calls-per-question roughly in half; (2) added retry-with-backoff (reading
+  the API's own suggested retry delay) so a 429 degrades into "please wait
+  ~Ns" instead of a crash. Also had to disable the SDK's own internal retry
+  (`HttpRetryOptions(attempts=1)`) — it was silently retrying 429s for
+  minutes before ever surfacing the error, which made failures invisible
+  instead of just slow. On a billed API key this constraint disappears
+  entirely; documented here because it's a real constraint we hit and
+  designed around, not a hypothetical.
 - Clarifying-question behavior depends on the model choosing to ask rather
   than guess — good system-prompt discipline helps but isn't a hard guarantee.
 
