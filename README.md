@@ -5,6 +5,10 @@ questions by querying two live monday.com boards (**Work Orders** and
 **Deals**), cleaning the underlying messy data on the fly, and computing
 exact aggregates rather than letting the LLM guess numbers.
 
+> **[Read the Decision Log](DECISION_LOG.md)** for assumptions, trade-offs,
+> what I'd do differently with more time, and how "leadership updates" was
+> interpreted.
+
 ## Architecture
 
 ```
