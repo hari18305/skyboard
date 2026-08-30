@@ -9,6 +9,18 @@ exact aggregates rather than letting the LLM guess numbers.
 > what I'd do differently with more time, and how "leadership updates" was
 > interpreted.
 
+## Screenshots
+
+**Asking a clarifying question instead of guessing**, when "overdue/stalled"
+wasn't yet defined against the actual columns:
+
+![Agent asking a clarifying question](screenshots/clarifying-question.jpeg)
+
+**One-click leadership update**, pulling a live sector breakdown (deal count
++ pipeline value) straight from the deals board:
+
+![Leadership update output](screenshots/leadership-update.jpeg)
+
 ## Architecture
 
 ```
