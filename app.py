@@ -23,7 +23,7 @@ from groq import Groq, APIStatusError
 from agent_tools import TOOL_SCHEMAS, TOOL_FUNCS, get_board_schema
 from config import GROQ_API_KEY, GROQ_MODEL, MONDAY_API_TOKEN, BOARD_IDS
 
-st.set_page_config(page_title="Skylark BI Agent", page_icon="📊", layout="centered")
+st.set_page_config(page_title="Skylark BI Agent", layout="centered")
 
 MAX_TOOL_ITERS = 10
 
@@ -155,9 +155,9 @@ def run_agent(client: Groq, messages: list) -> str:
                     # Too-large errors aren't time-based — retry immediately
                     # after shrinking, no point sleeping.
                     continue
-                return f"⚠️ The agent hit a Groq API error: {e}"
+                return f"The agent hit a Groq API error: {e}"
         else:
-            return "⚠️ Still rate-limited after retries — please wait a few seconds and try again."
+            return "Still rate-limited after retries — please wait a few seconds and try again."
 
         msg = resp.choices[0].message
 
@@ -194,7 +194,7 @@ def run_agent(client: Groq, messages: list) -> str:
                     result = json.dumps({"error": f"Tool '{tc.function.name}' raised: {e}"})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-    return "⚠️ Reached the tool-call step limit without a final answer — try rephrasing your question."
+    return "Reached the tool-call step limit without a final answer — try rephrasing your question."
 
 
 def send(text: str):
@@ -217,7 +217,7 @@ def send(text: str):
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
-st.title("📊 Skylark BI Agent")
+st.title("Skylark BI Agent")
 st.caption("Conversational business intelligence over your monday.com Work Orders and Deals boards.")
 
 if not GROQ_API_KEY:
@@ -236,12 +236,12 @@ if "messages" not in st.session_state:
 
 with st.sidebar:
     st.subheader("Status")
-    st.write("✅ Groq configured" if GROQ_API_KEY else "❌ Groq not configured")
-    st.write("✅ monday.com configured" if boards_configured() else "❌ monday.com not configured")
+    st.write("Groq: configured" if GROQ_API_KEY else "Groq: not configured")
+    st.write("monday.com: configured" if boards_configured() else "monday.com: not configured")
     st.divider()
-    if st.button("📋 Generate leadership update"):
+    if st.button("Generate leadership update"):
         send(LEADERSHIP_UPDATE_PROMPT)
-    if st.button("🔄 Reset conversation"):
+    if st.button("Reset conversation"):
         st.session_state.messages = []
         st.rerun()
 
