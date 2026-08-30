@@ -19,7 +19,7 @@ def get_secret(key: str, default=None):
 
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
-GEMINI_MODEL = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = get_secret("GEMINI_MODEL", "gemini-3.6-flash")
 
 MONDAY_API_TOKEN = get_secret("MONDAY_API_TOKEN")
 MONDAY_WORK_ORDERS_BOARD_ID = get_secret("MONDAY_WORK_ORDERS_BOARD_ID")

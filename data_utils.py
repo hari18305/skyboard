@@ -7,7 +7,6 @@ Deliberately schema-agnostic: it drives cleaning off each column's monday.com
 column names, so it works for whatever structure the CSV import produced.
 """
 import re
-from difflib import get_close_matches
 
 import pandas as pd
 
@@ -18,6 +17,26 @@ DATE_TYPES = {"date"}
 CATEGORY_TYPES = {"status", "dropdown", "color"}
 
 _NUMERIC_STRIP_RE = re.compile(r"[^0-9.\-]")
+
+# monday.com's quick-import column mapping frequently defaults everything to
+# a generic "text" type regardless of actual content (dates and currency
+# fields included). Rather than trust the declared type, sample each text
+# column's values and infer date/numeric semantics from their shape.
+_DATE_LIKE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}:\d{2})?$|^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$")
+_NUMERIC_LIKE_RE = re.compile(r"^[₹$€\s]*-?[\d,]+(\.\d+)?\s*%?$")
+
+
+def _infer_semantic_type(series: pd.Series) -> str:
+    non_empty = series.dropna().astype(str).str.strip()
+    non_empty = non_empty[non_empty != ""]
+    if len(non_empty) == 0:
+        return "text"
+    sample = non_empty if len(non_empty) <= 200 else non_empty.sample(200, random_state=0)
+    if sample.str.match(_DATE_LIKE_RE).mean() >= 0.8:
+        return "date"
+    if sample.str.match(_NUMERIC_LIKE_RE).mean() >= 0.8:
+        return "numeric"
+    return "text"
 
 
 def _clean_numeric(text: str):
@@ -46,31 +65,36 @@ def _clean_date(text: str):
 
 def _normalize_category_series(series: pd.Series) -> tuple[pd.Series, list[str]]:
     """
-    Trims/cases category text and collapses near-duplicate labels
+    Trims whitespace and collapses labels that differ only by case/whitespace
     (e.g. 'Energy ', 'energy', 'ENERGY' -> 'Energy') so grouping/filtering
     doesn't silently split the same real-world value into buckets.
+
+    Deliberately exact-match-after-normalization only (no fuzzy/edit-distance
+    matching): this data has many structured ID-like codes (e.g. 'OWNER_001'
+    vs 'OWNER_002', 'SDPLDEAL-075' vs 'SDPLDEAL-101') that are textually
+    similar but semantically distinct records — fuzzy similarity matching
+    was tried and rejected because it merged those together.
     """
     notes = []
     stripped = series.fillna("").astype(str).str.strip()
     non_empty = stripped[stripped != ""]
 
+    # First-seen original casing wins as the canonical label for each
+    # lowercased key, so e.g. 'Energy' (seen first) beats a later 'energy'.
     canonical_map: dict[str, str] = {}
-    canonical_labels: list[str] = []
     for val in non_empty.unique():
         key = val.lower()
-        match = get_close_matches(key, [c.lower() for c in canonical_labels], n=1, cutoff=0.86)
-        if match:
-            existing = next(c for c in canonical_labels if c.lower() == match[0])
-            canonical_map[val] = existing
-        else:
-            canonical_labels.append(val)
-            canonical_map[val] = val
+        canonical_map.setdefault(key, val)
 
-    collapsed = {k: v for k, v in canonical_map.items() if k != v}
+    collapsed = {
+        val: canonical_map[val.lower()]
+        for val in non_empty.unique()
+        if val != canonical_map[val.lower()]
+    }
     if collapsed:
-        notes.append(f"Normalized near-duplicate category labels: {collapsed}")
+        notes.append(f"Normalized case/whitespace-only label variants: {collapsed}")
 
-    normalized = stripped.map(lambda v: canonical_map.get(v, v))
+    normalized = stripped.map(lambda v: canonical_map.get(v.lower(), v) if v else v)
     normalized = normalized.replace("", pd.NA)
     return normalized, notes
 
@@ -119,12 +143,23 @@ def get_clean_board(board: str) -> dict:
         total = len(col)
         missing_before = col.isna().sum() + (col.astype(str).str.strip() == "").sum()
 
-        if mtype in NUMERIC_TYPES:
+        effective_type = mtype
+        if mtype not in NUMERIC_TYPES and mtype not in DATE_TYPES:
+            inferred = _infer_semantic_type(col)
+            if inferred in ("date", "numeric") and inferred != mtype:
+                notes.append(
+                    f"Column '{title}': monday.com declared type '{mtype}', but values look like "
+                    f"{inferred} data — inferring and parsing as {inferred}."
+                )
+                effective_type = inferred
+            schema[title] = f"{mtype} (inferred: {inferred})" if inferred != mtype else mtype
+
+        if effective_type in NUMERIC_TYPES or effective_type == "numeric":
             df[title] = col.map(_clean_numeric)
             unparseable = df[title].isna().sum() - missing_before
             if unparseable > 0:
                 notes.append(f"Column '{title}': {unparseable} value(s) could not be parsed as numbers.")
-        elif mtype in DATE_TYPES:
+        elif effective_type in DATE_TYPES or effective_type == "date":
             df[title] = col.map(_clean_date)
             unparseable = df[title].isna().sum() - missing_before
             if unparseable > 0:

@@ -85,6 +85,10 @@ Deploy.
   a dedicated small classification pass would be more robust for messier text.
 - No pagination past 500 items per board.
 - No caching layer, so latency scales with monday.com API round-trips.
+- Observed the Gemini free-tier per-minute token quota (250k) during live
+  testing — rapid successive queries can hit a 429. The app catches this and
+  shows a friendly error instead of crashing, but a production version would
+  need retry/backoff or a paid tier.
 - Clarifying-question behavior depends on the model choosing to ask rather
   than guess — good system-prompt discipline helps but isn't a hard guarantee.
 
